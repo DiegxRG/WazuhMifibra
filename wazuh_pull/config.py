@@ -38,7 +38,9 @@ class Settings:
     retry_max_seconds: int
     ack_retention_days: int
     alert_lookback: int
+    alert_review_history: int
     alert_overlap: int
+    agent_group: str
 
     @property
     def uses_alerts(self) -> bool:
@@ -49,10 +51,10 @@ class Settings:
             raise ValueError("Configura WAZUH_INDEXER_URL, WAZUH_INDEXER_USER y WAZUH_INDEXER_PASSWORD.")
         if not self.uses_alerts and not re.fullmatch(r"wazuh-states-vulnerabilities-[a-z0-9_.-]+", self.index):
             raise ValueError("WAZUH_INDEX debe ser wazuh-alerts-* o un índice concreto de vulnerabilidades.")
-        if any((self.api_url, self.api_user, self.api_password)) and not all(
-            (self.api_url, self.api_user, self.api_password)
-        ):
-            raise ValueError("Configura la URL y ambas credenciales de WAZUH_API para enriquecer IP.")
+        if not re.fullmatch(r"[a-zA-Z0-9_.-]+", self.agent_group) or self.agent_group in {".", ".."}:
+            raise ValueError("Configura WAZUH_AGENT_GROUP con el grupo autorizado de Mi Fibra.")
+        if not (self.api_url and self.api_user and self.api_password):
+            raise ValueError("Configura la URL y ambas credenciales de WAZUH_API para validar el grupo de agentes.")
 
 
 def load_settings(env_file: Path) -> Settings:
@@ -93,6 +95,10 @@ def load_settings(env_file: Path) -> Settings:
     page_size = positive_int("WAZUH_PAGE_SIZE", 500)
     if page_size > 10_000:
         raise ValueError("WAZUH_PAGE_SIZE debe ser menor o igual a 10000.")
+    alert_lookback = positive_int("WAZUH_ALERT_LOOKBACK_SECONDS", 2_592_000)
+    alert_review_history = positive_int("WAZUH_ALERT_REVIEW_HISTORY_SECONDS", 7_776_000)
+    if alert_review_history < alert_lookback:
+        raise ValueError("WAZUH_ALERT_REVIEW_HISTORY_SECONDS debe cubrir la ventana inicial de alertas.")
 
     return Settings(
         indexer_url=https_url("WAZUH_INDEXER_URL"),
@@ -119,6 +125,8 @@ def load_settings(env_file: Path) -> Settings:
         retry_seconds=retry_seconds,
         retry_max_seconds=retry_max,
         ack_retention_days=positive_int("DELIVERY_ACK_RETENTION_DAYS", 90),
-        alert_lookback=positive_int("WAZUH_ALERT_LOOKBACK_SECONDS", 7200),
+        alert_lookback=alert_lookback,
+        alert_review_history=alert_review_history,
         alert_overlap=positive_int("WAZUH_ALERT_OVERLAP_SECONDS", 300),
+        agent_group=value("WAZUH_AGENT_GROUP"),
     )

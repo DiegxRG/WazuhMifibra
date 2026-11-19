@@ -16,6 +16,7 @@ from wazuh_pull.client import SourceError, WazuhClient
 from wazuh_pull.collector import collect
 from wazuh_pull.config import ALERT_INDEX, load_settings
 from wazuh_pull.delivery import alert_window, deliver
+from wazuh_pull.reconciliation import initial_alert_review
 
 FIXTURE = Path(__file__).parent / "fixtures" / "inventory.json"
 
@@ -34,6 +35,7 @@ def settings(monkeypatch, tmp_path):
         index="wazuh-states-vulnerabilities-example",
         indexer_url="https://indexer.example",
         backend_url="https://backend.example/guarda_alarma.php",
+        agent_group="example-mi-fibra",
         delivery_state=tmp_path / "delivery.sqlite3",
         retry_seconds=1,
         retry_max_seconds=30,
@@ -150,15 +152,21 @@ def test_manager_rejects_partial_agent_results(settings):
         WazuhClient(settings, http).agents({"002", "003"})
 
 
-@pytest.mark.parametrize(("complete", "no_backend"), [(True, False), (False, False), (True, True)])
-def test_live_cli_honors_capture_completeness_and_no_backend(sample, monkeypatch, tmp_path, complete, no_backend):
+@pytest.mark.parametrize(("complete", "no_backend", "unexpected_agent"), [
+    (True, False, False), (False, False, False), (True, True, False), (True, False, True),
+])
+def test_live_cli_honors_capture_completeness_and_no_backend(
+    sample, monkeypatch, tmp_path, complete, no_backend, unexpected_agent,
+):
     monkeypatch.setenv("WAZUH_INDEXER_URL", "https://indexer.example")
     monkeypatch.setenv("WAZUH_INDEXER_USER", "fixture")
     monkeypatch.setenv("WAZUH_INDEXER_PASSWORD", "fixture")
     monkeypatch.setenv("WAZUH_INDEX", sample["index"])
     monkeypatch.setenv("WAZUH_SOURCE_ID", "mifibra")
-    for name in ("WAZUH_API_URL", "WAZUH_API_USER", "WAZUH_API_PASSWORD"):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("WAZUH_API_URL", "https://manager.example")
+    monkeypatch.setenv("WAZUH_API_USER", "fixture")
+    monkeypatch.setenv("WAZUH_API_PASSWORD", "fixture")
+    monkeypatch.setenv("WAZUH_AGENT_GROUP", "example-mi-fibra")
     monkeypatch.setenv("BACKEND_ENABLED", "true")
     monkeypatch.setenv("BACKEND_URL", "https://backend.example/guarda_alarma.php")
     state = tmp_path / "delivery.sqlite3"
@@ -169,10 +177,10 @@ def test_live_cli_honors_capture_completeness_and_no_backend(sample, monkeypatch
     source_http = MagicMock()
     source_http.__enter__.return_value = source_http
     hit = sample["hits"][2]
-    source_http.request.return_value = response({
+    source_http.request.side_effect = [*group_responses("999" if unexpected_agent else "003"), response({
         "timed_out": False, "_shards": {"failed": 0 if complete else 1},
         "hits": {"total": {"value": 1, "relation": "eq"}, "hits": [hit]},
-    })
+    })]
     monkeypatch.setattr("wazuh_pull.cli.requests.Session", Mock(side_effect=[backend_http, source_http]))
 
     args = ["--once", "--env-file", str(tmp_path / ".env")]
@@ -182,14 +190,15 @@ def test_live_cli_honors_capture_completeness_and_no_backend(sample, monkeypatch
         preview = tmp_path / "preview.json"
         args.extend(["--no-backend", "--output", str(preview)])
 
-    assert main(args) == (0 if complete else 1)
-    assert state.exists() is (complete or no_backend)
-    assert backend_http.post.call_count == int(complete and not no_backend)
+    accepted = complete and not unexpected_agent
+    assert main(args) == (0 if accepted else 1)
+    assert state.exists() is (accepted or no_backend)
+    assert backend_http.post.call_count == int(accepted and not no_backend)
     if no_backend:
         assert state.read_bytes() == original_state
         payload = json.loads(preview.read_text(encoding="utf-8"))["request_preview"]
         assert payload["alarms"][0]["finding_id"] == "wazuh-mifibra-003_CVE-2026-12346"
-    elif complete:
+    elif accepted:
         payload = json.loads(backend_http.post.call_args.kwargs["data"])
         assert payload["alarms"][0]["finding_id"] == "wazuh-mifibra-003_CVE-2026-12346"
 
@@ -293,6 +302,30 @@ def search_results(hits, *, total=None, failed=0):
     })
 
 
+def group_responses(agent_id):
+    return [
+        response({"data": {"token": "fixture-token"}}),
+        response({"error": 0, "data": {"total_affected_items": 1,
+                  "affected_items": [{"id": agent_id, "group": ["example-mi-fibra"]}]}}),
+    ]
+
+
+def test_group_lookup_rejects_empty_and_inconsistent_membership(settings):
+    settings = replace(settings, api_url="https://manager.example", api_user="fixture", api_password="fixture")
+    http = Mock()
+    http.request.side_effect = [
+        response({"data": {"token": "fixture-token"}}),
+        response({"error": 0, "data": {"total_affected_items": 2,
+                  "affected_items": [{"id": "002", "group": ["example-mi-fibra"]}]}}),
+        response({"error": 0, "data": {"total_affected_items": 2, "affected_items": []}}),
+    ]
+    with pytest.raises(SourceError, match="paginación"):
+        WazuhClient(settings, http).group_agents()
+    calls = http.request.call_args_list
+    assert calls[1].args == ("GET", "https://manager.example/groups/example-mi-fibra/agents")
+    assert calls[2].kwargs["params"]["offset"] == 1
+
+
 def test_event_preview_uses_vulnerability_severity_and_event_timestamp(settings, tmp_path):
     sample_path = tmp_path / "alerts.json"
     preview = tmp_path / "preview.json"
@@ -319,12 +352,78 @@ def test_alert_search_splits_bounded_ranges_using_only_search(settings):
     last = wazuh_alert("2", 1795119001, "Critical")
     http = Mock()
     http.request.side_effect = [search_results([first], total=2), search_results([first]), search_results([last])]
-    assert list(WazuhClient(settings, http).alert_hits(1795119000000, 1795119002000)) == [first, last]
+    assert list(WazuhClient(settings, http).alert_hits(1795119000000, 1795119002000, {"002"})) == [first, last]
     queries = [call.kwargs["json"]["query"]["bool"]["filter"] for call in http.request.call_args_list]
     assert [(filters[0]["range"]["timestamp"]["gte"], filters[0]["range"]["timestamp"]["lt"]) for filters in queries] == [
         (1795119000000, 1795119002000), (1795119000000, 1795119001000), (1795119001000, 1795119002000),
     ]
     assert all(call.args == ("GET", "https://indexer.example/wazuh-alerts-*/_search") for call in http.request.call_args_list)
+    assert all({"terms": {"agent.id": ["002"]}} in filters for filters in queries)
+
+
+def test_initial_review_does_not_clear_multiple_package_versions_with_ambiguous_solved():
+    now = 1795120000
+    first = wazuh_alert("1", now - 50, "High")
+    second = wazuh_alert("2", now - 40, "High")
+    second["_source"]["data"]["vulnerability"]["package"]["version"] = "2.0"
+    uncertain = wazuh_alert("3", now - 30, "High", status="Solved")
+    del uncertain["_source"]["data"]["vulnerability"]["package"]["version"]
+    hits, review = initial_alert_review([uncertain, second, first], (now - 300) * 1000)
+
+    assert {item["_id"] for item in hits} == {"1", "2"}
+    assert review["pares_recientes"] == 1
+    assert review["pares_recientes_con_solved_posterior"] == 0
+
+
+def test_initial_live_preview_removes_solved_and_lists_older_criticals_separately(monkeypatch, tmp_path):
+    for name, value in {
+        "WAZUH_INDEX": ALERT_INDEX,
+        "WAZUH_INDEXER_URL": "https://indexer.example",
+        "WAZUH_INDEXER_USER": "fixture",
+        "WAZUH_INDEXER_PASSWORD": "fixture",
+        "WAZUH_API_URL": "https://manager.example",
+        "WAZUH_API_USER": "fixture",
+        "WAZUH_API_PASSWORD": "fixture",
+        "WAZUH_AGENT_GROUP": "example-mi-fibra",
+        "BACKEND_ENABLED": "true",
+        "BACKEND_URL": "https://backend.example/guarda_alarma.php",
+        "DELIVERY_STATE_PATH": str(tmp_path / "delivery.sqlite3"),
+        "WAZUH_ALERT_LOOKBACK_SECONDS": "2592000",
+        "WAZUH_ALERT_REVIEW_HISTORY_SECONDS": "7776000",
+    }.items():
+        monkeypatch.setenv(name, value)
+    now = 1795120000
+    monkeypatch.setattr("wazuh_pull.cli.time.time", lambda: now)
+    older = wazuh_alert("older", now - 45 * 86400, "Critical", cve="CVE-2026-11223")
+    resolved = wazuh_alert("fixed", now - 120, "Critical", cve="CVE-2026-11224")
+    resolution = wazuh_alert("solved", now - 110, "Critical", cve="CVE-2026-11224", status="Solved")
+    recurrent = wazuh_alert("redetected", now - 50, "High")
+    earlier_resolution = wazuh_alert("earlier_solved", now - 60, "High", status="Solved")
+    indexer = MagicMock()
+    indexer.__enter__.return_value = indexer
+    indexer.request.side_effect = [
+        *group_responses("002"), search_results([earlier_resolution, resolution, recurrent, older, resolved]),
+    ]
+    backend = MagicMock()
+    backend.__enter__.return_value = backend
+    monkeypatch.setattr("wazuh_pull.cli.requests.Session", Mock(side_effect=[backend, indexer]))
+    preview_path = tmp_path / "preview.json"
+    assert main(["--once", "--no-backend", "--output", str(preview_path), "--env-file", str(tmp_path / ".env")]) == 0
+
+    preview = json.loads(preview_path.read_text(encoding="utf-8"))
+    alarm = preview["request_preview"]["alarms"][0]
+    assert len(preview["request_preview"]["alarms"]) == 1
+    assert len(alarm) == 13 and alarm["vulnerability_id"] == "CVE-2026-12345"
+    review = preview["revision_inicial"]
+    assert review["estado"] == "por_verificar"
+    assert review["grupo_agentes"] == "example-mi-fibra" and review["agentes_autorizados"] == 1
+    assert review["pares_recientes_con_solved_posterior"] == 1
+    assert [row["vulnerability_id"] for row in review["criticos_antiguos"]] == ["CVE-2026-11223"]
+    filters = indexer.request.call_args.kwargs["json"]["query"]["bool"]["filter"]
+    assert {"match_phrase": {"data.vulnerability.status": "Solved"}} in filters[2]["bool"]["should"]
+    assert filters[0]["range"]["timestamp"]["gte"] == (now - 90 * 86400) * 1000
+    backend.post.assert_not_called()
+    assert not (tmp_path / "delivery.sqlite3").exists()
 
 
 def test_alert_runs_keep_progress_on_overlap_and_retry_exact_body(monkeypatch, tmp_path):
@@ -333,6 +432,10 @@ def test_alert_runs_keep_progress_on_overlap_and_retry_exact_body(monkeypatch, t
         "WAZUH_INDEXER_URL": "https://indexer.example",
         "WAZUH_INDEXER_USER": "fixture",
         "WAZUH_INDEXER_PASSWORD": "fixture",
+        "WAZUH_API_URL": "https://manager.example",
+        "WAZUH_API_USER": "fixture",
+        "WAZUH_API_PASSWORD": "fixture",
+        "WAZUH_AGENT_GROUP": "example-mi-fibra",
         "BACKEND_ENABLED": "true",
         "BACKEND_URL": "https://backend.example/guarda_alarma.php",
         "BACKEND_ALLOW_EMPTY": "true",
@@ -354,7 +457,10 @@ def test_alert_runs_keep_progress_on_overlap_and_retry_exact_body(monkeypatch, t
     indexer = MagicMock()
     indexer.__enter__.return_value = indexer
     indexer.request.side_effect = [
-        search_results([first]), search_results([], failed=1), search_results([late, first]), search_results([first, late]),
+        reply
+        for result in (search_results([first]), search_results([], failed=1),
+                       search_results([late, first]), search_results([first, late]))
+        for reply in (*group_responses("002"), result)
     ]
     monkeypatch.setattr("wazuh_pull.cli.requests.Session", Mock(side_effect=[backend, indexer] * 4))
     args = ["--once", "--env-file", str(env_file)]

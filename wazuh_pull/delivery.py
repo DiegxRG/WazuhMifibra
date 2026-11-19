@@ -42,7 +42,7 @@ def _json(value) -> str:
 
 
 def _scope(settings: Settings) -> str:
-    keys = [settings.backend_url, settings.backend_local, settings.source_id, "wazuh"]
+    keys = [settings.backend_url, settings.backend_local, settings.source_id, "wazuh", settings.agent_group]
     if settings.uses_alerts:
         keys.extend([settings.indexer_url, settings.index])
     return hashlib.sha256(_json(keys).encode("utf-8")).hexdigest()
@@ -54,6 +54,7 @@ class AlertWindow:
     end_ms: int
     previous_end: int | None
     seen: frozenset[str]
+    priority_from_ms: int | None = None
     events: dict[str, int] = field(default_factory=dict)
 
 
@@ -72,7 +73,10 @@ def alert_window(settings: Settings, end_ms: int) -> AlertWindow:
                     previous_end = previous[0]
                     seen = frozenset(row[0] for row in db.execute("SELECT identity FROM seen_alerts WHERE scope=?", (scope,)))
     if previous_end is None:
-        start_ms = end_ms - settings.alert_lookback * 1000
+        return AlertWindow(
+            end_ms - settings.alert_review_history * 1000, end_ms, None, seen,
+            priority_from_ms=end_ms - settings.alert_lookback * 1000,
+        )
     elif end_ms <= previous_end:
         # An older clock cannot move the checkpoint backwards.
         start_ms = end_ms
@@ -163,13 +167,14 @@ def _enqueue_alerts(
         result = _enqueue(db, scope, alarms, findings, window.end_ms / 1000, deduplicate=False)
         if result == "captura_anterior":
             return result
+    overlap_start = window.end_ms - overlap * 1000
     db.executemany(
         "INSERT INTO seen_alerts(scope, identity, timestamp_ms) VALUES (?, ?, ?)",
-        ((scope, identity, timestamp) for identity, timestamp in window.events.items()),
+        ((scope, identity, timestamp) for identity, timestamp in window.events.items() if timestamp >= overlap_start),
     )
     db.execute("INSERT INTO alert_progress VALUES (?, ?) ON CONFLICT(scope) DO UPDATE SET end_ms=excluded.end_ms",
                (scope, window.end_ms))
-    db.execute("DELETE FROM seen_alerts WHERE scope=? AND timestamp_ms<?", (scope, window.end_ms - overlap * 1000))
+    db.execute("DELETE FROM seen_alerts WHERE scope=? AND timestamp_ms<?", (scope, overlap_start))
     return result
 
 
@@ -187,6 +192,8 @@ def deliver(
         return {**result, "snapshot": "envio_deshabilitado"}
     if not settings.backend_url:
         raise ValueError("Configura BACKEND_URL para habilitar el envío.")
+    if not settings.agent_group:
+        raise ValueError("Configura WAZUH_AGENT_GROUP para habilitar el envío.")
     if alarms is not None and (started_at is None or findings is None):
         raise ValueError("La entrega requiere los hallazgos y el inicio de la captura.")
     if alarms is not None and settings.uses_alerts != (window is not None):

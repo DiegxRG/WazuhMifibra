@@ -20,6 +20,7 @@ from wazuh_pull.client import SourceError, WazuhClient, alert_key
 from wazuh_pull.collector import collect
 from wazuh_pull.config import Settings, load_settings
 from wazuh_pull.delivery import AlertWindow, alert_window, deliver
+from wazuh_pull.reconciliation import initial_alert_review
 
 log = logging.getLogger(__name__)
 
@@ -47,24 +48,22 @@ def _read_sample(path: Path) -> tuple[list[dict], dict[str, dict]]:
     return hits, agents
 
 
-def _write_preview(path: Path, findings: list[dict], alarms: list[dict]) -> None:
+def _write_preview(path: Path, findings: list[dict], alarms: list[dict], review: dict | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False)
     temp_path = Path(temporary.name)
+    preview = {
+        "request_preview": {
+            "snapshot_id": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "alarms": alarms,
+        },
+        "findings": findings,
+    }
+    if review is not None:
+        preview["revision_inicial"] = review
     try:
         with temporary:
-            json.dump(
-                {
-                    "request_preview": {
-                        "snapshot_id": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        "alarms": alarms,
-                    },
-                    "findings": findings,
-                },
-                temporary,
-                indent=2,
-                ensure_ascii=False,
-            )
+            json.dump(preview, temporary, indent=2, ensure_ascii=False)
             temporary.write("\n")
         os.replace(temp_path, path)
     finally:
@@ -83,8 +82,10 @@ def _log_delivery(result: dict) -> int:
     return int(bool(result["error"] or result["pending"] or result["snapshot"] == "snapshot_vacio_retenido"))
 
 
-def _new_alerts(source: WazuhClient, window: AlertWindow) -> Iterator[dict]:
-    with closing(source.alert_hits(window.start_ms, window.end_ms)) as hits:
+def _new_alerts(source: WazuhClient, window: AlertWindow, allowed_agents: set[str]) -> Iterator[dict]:
+    with closing(source.alert_hits(
+        window.start_ms, window.end_ms, allowed_agents, include_solved=window.priority_from_ms is not None,
+    )) as hits:
         for hit in hits:
             key = alert_key(hit)
             if key in window.seen:
@@ -109,16 +110,30 @@ def _run_live(
     while True:
         started_at = time.time()
         capture = {}
+        review = None
         status = 0
         try:
+            group_agents = source.group_agents()
+            allowed_agents = set(group_agents)
             window = alert_window(settings, int(started_at * 1000)) if settings.uses_alerts else None
-            observations = _new_alerts(source, window) if window is not None else source.vulnerability_hits()
+            observations = (_new_alerts(source, window, allowed_agents) if window is not None
+                            else source.vulnerability_hits(allowed_agents))
             with closing(observations) as hits:
-                collection = collect(hits, settings.source_id, source.agents, from_alerts=settings.uses_alerts)
+                if window is not None and window.priority_from_ms is not None:
+                    chosen, review = initial_alert_review(hits, window.priority_from_ms)
+                    review["grupo_agentes"] = settings.agent_group
+                    review["agentes_autorizados"] = len(allowed_agents)
+                    collection = collect(chosen, settings.source_id, lambda _ids: group_agents, from_alerts=True)
+                else:
+                    collection = collect(hits, settings.source_id, lambda _ids: group_agents, from_alerts=settings.uses_alerts)
             alarms = prepare_alarms(collection.findings, settings)
+            if review is not None:
+                log.info("revision_inicial eventos=%d resueltos_en_ventana=%d criticos_antiguos=%d",
+                         review["eventos_revisados"], review["pares_recientes_con_solved_posterior"],
+                         len(review["criticos_antiguos"]))
             log.info("documentos=%s alarmas_criticas_y_altas=%s", collection.documents, len(alarms))
             if output:
-                _write_preview(output, collection.findings, alarms)
+                _write_preview(output, collection.findings, alarms, review)
             capture = {"alarms": alarms, "findings": collection.findings, "started_at": started_at, "window": window}
         except (SourceError, OSError, sqlite3.Error) as exc:
             log.error("Captura incompleta: %s", exc)
