@@ -1,0 +1,44 @@
+{
+  "index": "wazuh-states-vulnerabilities-example",
+  "hits": [
+    {
+      "_index": "wazuh-states-vulnerabilities-example",
+      "_id": "002_example1_CVE-2026-12345",
+      "_source": {
+        "agent": {"id": "002", "name": "example-agent"},
+        "package": {"name": "example-lib", "version": "1.0", "architecture": "x86_64", "type": "deb"},
+        "vulnerability": {
+          "id": "CVE-2026-12345", "severity": "High",
+          "score": {"base": 8.1, "version": "3.1"},
+          "detected_at": "2026-11-18T20:10:31.470Z"
+        }
+      }
+    },
+    {
+      "_index": "wazuh-states-vulnerabilities-example",
+      "_id": "002_example2_CVE-2026-12345",
+      "_source": {
+        "agent": {"id": "002", "name": "example-agent"},
+        "package": {"name": "example-server", "version": "1.0", "architecture": "x86_64", "type": "deb"},
+        "vulnerability": {
+          "id": "CVE-2026-12345", "severity": "Critical",
+          "score": {"base": 9.8, "version": "3.1"},
+          "detected_at": "2026-11-18T21:10:31.470Z"
+        }
+      }
+    },
+    {
+      "_index": "wazuh-states-vulnerabilities-example",
+      "_id": "003_example3_CVE-2026-12346",
+      "_source": {
+        "agent": {"id": "003", "name": "other-agent", "ip": "192.0.2.43"},
+        "package": {"name": "example-lib", "version": "1.0"},
+        "vulnerability": {
+          "id": "CVE-2026-12346", "severity": "High",
+          "score": {"base": 8.1}, "detected_at": "2026-11-19T01:21:00+01:00"
+        }
+      }
+    }
+  ],
+  "agent": {"id": "002", "name": "example-agent", "ip": "192.0.2.42", "registerIP": "any"}
+}
