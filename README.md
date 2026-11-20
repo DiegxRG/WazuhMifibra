@@ -48,3 +48,21 @@ Cada lote tiene un intento inicial y hasta dos reintentos automáticos ante fall
 Si se configura un índice concreto `wazuh-states-vulnerabilities-*`, el conector conserva el modo de inventario y envía capturas completas cuando cambia su contenido. `BACKEND_ALLOW_EMPTY` aplica a ese modo.
 
 Para ejecutar las pruebas locales con pytest instalado, usa `python -m pytest -q`.
+
+## Cron semanal
+
+Programa una ejecución los domingos a las 09:00, hora de Lima. Ajusta la ruta
+al clon del servidor y usa la cuenta que ejecuta la integración.
+
+```cron
+CRON_TZ=America/Lima
+0 9 * * 0 /bin/bash /ruta/Wazuh-MiFibra/scripts/run_weekly_delivery.sh
+```
+
+El lanzador registra inicio y resultado en `runtime/wazuh/cron.log` y usa un
+bloqueo para evitar ejecuciones semanales simultáneas. Con `BACKEND_ENABLED=false`
+registra que el envío fue omitido y termina antes de consultar las fuentes.
+
+Antes de habilitar el envío, comprueba el TLS de Wazuh con una captura
+`--no-backend`. Si ya hubo un envío manual, concilia su recibo con la ventana
+inicial para evitar registrar esas mismas detecciones otra vez.
