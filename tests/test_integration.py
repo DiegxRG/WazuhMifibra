@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import sqlite3
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,7 +16,7 @@ from wazuh_pull.cli import main
 from wazuh_pull.client import SourceError, WazuhClient
 from wazuh_pull.collector import collect
 from wazuh_pull.config import ALERT_INDEX, load_settings
-from wazuh_pull.delivery import alert_window, deliver
+from wazuh_pull.delivery import _scope, alert_window, deliver
 from wazuh_pull.reconciliation import initial_alert_review
 
 FIXTURE = Path(__file__).parent / "fixtures" / "inventory.json"
@@ -46,6 +47,14 @@ def response(body, status=200):
     reply = Mock(status_code=status)
     reply.json.return_value = body
     return reply
+
+
+def accepted_receipt(_url, **kwargs):
+    payload = json.loads(kwargs["data"])
+    count = len(payload["alarms"])
+    return response({"success": True, "data": {
+        "snapshot_id": payload["snapshot_id"], "total_alarmas": count, "registros_exitosos": count,
+    }})
 
 
 def findings_from(sample, settings):
@@ -173,7 +182,7 @@ def test_live_cli_honors_capture_completeness_and_no_backend(
     monkeypatch.setenv("DELIVERY_STATE_PATH", str(state))
     backend_http = MagicMock()
     backend_http.__enter__.return_value = backend_http
-    backend_http.post.return_value = response({"success": True})
+    backend_http.post.side_effect = accepted_receipt
     source_http = MagicMock()
     source_http.__enter__.return_value = source_http
     hit = sample["hits"][2]
@@ -206,7 +215,7 @@ def test_live_cli_honors_capture_completeness_and_no_backend(
 def test_outbox_deduplicates_date_and_order_but_captures_package_changes(sample, settings, monkeypatch):
     settings = replace(settings, backend_enabled=True)
     http = Mock()
-    http.post.return_value = response({"success": True})
+    http.post.side_effect = accepted_receipt
     backend = BackendAlarmClient(settings, http)
     monkeypatch.setattr("wazuh_pull.delivery.time.time", lambda: 1795120000)
     findings = findings_from(sample, settings)
@@ -245,7 +254,12 @@ def test_outbox_replays_identical_body_after_restart_in_fifo(sample, settings, m
     receipt = {"success": False, "data": {"snapshot_id": snapshot_id, "total_alarmas": 2, "errores": errors}}
 
     retry_http = Mock()
-    retry_http.post.side_effect = [response(receipt), response({"success": True})]
+    def resend(url, **kwargs):
+        if kwargs["data"] == original_body:
+            return response(receipt)
+        return accepted_receipt(url, **kwargs)
+
+    retry_http.post.side_effect = resend
     backend = BackendAlarmClient(settings, retry_http)
     alarms[0]["cvss_score"] = 10.0
     assert deliver(backend, alarms=alarms, findings=findings, started_at=2)["pending"] == 2
@@ -257,15 +271,92 @@ def test_outbox_replays_identical_body_after_restart_in_fifo(sample, settings, m
     assert retry_http.post.call_args_list[1].kwargs["data"] != original_body
 
 
-def test_partial_receipt_keeps_the_snapshot_pending(sample, settings):
+@pytest.mark.parametrize("status", [200, 503])
+def test_partial_receipt_requires_manual_review(sample, settings, status):
     http = Mock()
-    http.post.return_value = response({"success": True, "data": {"registros_exitosos": 1}})
+    http.post.return_value = response({"success": True, "data": {"registros_exitosos": 1}}, status)
     settings = replace(settings, backend_enabled=True)
     findings = findings_from(sample, settings)
     result = deliver(BackendAlarmClient(settings, http), alarms=prepare_alarms(findings, settings),
                      findings=findings, started_at=1)
-    assert result["sent"] == 0 and result["pending"] == 1
-    assert "parcial" in result["error"]
+    assert result["sent"] == 0 and result["pending"] == 0 and result["review"] == 1
+    assert result["review_snapshot"] == result["snapshot"]
+    assert "recibo parcial" in result["error"] or "sin confirmar" in result["error"]
+
+
+def test_transient_failures_have_three_attempts_even_after_restarts(sample, settings, monkeypatch):
+    settings = replace(settings, backend_enabled=True)
+    findings = findings_from(sample, settings)
+    clock = [1795120000]
+    monkeypatch.setattr("wazuh_pull.delivery.time.time", lambda: clock[0])
+    http = Mock()
+    http.post.return_value = response({"success": False}, 503)
+    first = deliver(BackendAlarmClient(settings, http), alarms=prepare_alarms(findings, settings),
+                    findings=findings, started_at=1)
+    assert first["pending"] == 1
+    clock[0] += 1
+    assert deliver(BackendAlarmClient(settings, http))["pending"] == 1
+    clock[0] += 2
+    assert deliver(BackendAlarmClient(settings, http))["review"] == 1
+    clock[0] += 600
+    assert deliver(BackendAlarmClient(settings, http))["review"] == 1
+    assert http.post.call_count == 3
+    assert len({call.kwargs["data"] for call in http.post.call_args_list}) == 1
+    with sqlite3.connect(settings.delivery_state) as db:
+        assert db.execute("SELECT attempts,delivery_status FROM snapshots").fetchone() == (3, "review")
+
+
+def test_legacy_delivery_state_preserves_acks_and_parks_spent_lots(settings):
+    settings = replace(settings, backend_enabled=True)
+    scope = _scope(settings)
+    with sqlite3.connect(settings.delivery_state) as db:
+        db.execute("""CREATE TABLE snapshots (
+            id INTEGER PRIMARY KEY, scope TEXT NOT NULL, snapshot_id TEXT NOT NULL,
+            body TEXT NOT NULL, context TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt REAL NOT NULL DEFAULT 0, acknowledged_at REAL, last_error TEXT,
+            UNIQUE(scope, snapshot_id)
+        )""")
+        db.executemany(
+            "INSERT INTO snapshots(scope,snapshot_id,body,context,attempts,acknowledged_at) VALUES (?,?,?,?,?,?)",
+            [(scope, "accepted-before-upgrade", "confirmed-body", "[]", 0, 4_000_000_000),
+             (scope, "failed-before-upgrade", "original-body", "[]", 5, None)],
+        )
+    http = Mock()
+    assert deliver(BackendAlarmClient(settings, http))["review"] == 1
+    http.post.assert_not_called()
+    with sqlite3.connect(settings.delivery_state) as db:
+        assert db.execute("SELECT delivery_status,attempts,body FROM snapshots ORDER BY id").fetchall() == [
+            ("acked", 0, "confirmed-body"), ("review", 5, "original-body"),
+        ]
+
+
+def test_permanent_failure_blocks_fifo_and_allows_a_single_manual_attempt(sample, settings, monkeypatch, tmp_path):
+    settings = replace(settings, backend_enabled=True)
+    http = Mock()
+    http.post.return_value = response({"success": False}, 422)
+    backend = BackendAlarmClient(settings, http)
+    findings = findings_from(sample, settings)
+    alarms = prepare_alarms(findings, settings)
+    result = deliver(backend, alarms=alarms, findings=findings, started_at=1)
+    snapshot_id = result["snapshot"]
+    assert result["review"] == 1 and result["pending"] == 0
+    alarms[0]["cvss_score"] = 10.0
+    assert deliver(backend, alarms=alarms, findings=findings, started_at=2)["pending"] == 1
+    assert http.post.call_count == 1
+
+    monkeypatch.setattr("wazuh_pull.cli.load_settings", lambda _path: settings)
+    monkeypatch.setattr("wazuh_pull.cli.requests.Session", Mock(side_effect=AssertionError("operator action opened HTTP")))
+    assert main(["--retry-reviewed", snapshot_id, "--env-file", str(tmp_path / ".env")]) == 0
+    http.post.return_value = response({"success": False}, 503)
+    assert deliver(backend)["review"] == 1
+    assert deliver(backend)["pending"] == 1
+    assert http.post.call_count == 2
+    assert http.post.call_args_list[0].kwargs["data"] == http.post.call_args_list[1].kwargs["data"]
+
+    assert main(["--confirm-reviewed", snapshot_id, "--env-file", str(tmp_path / ".env")]) == 0
+    http.post.side_effect = accepted_receipt
+    assert deliver(backend)["sent"] == 1
+    assert http.post.call_count == 3
 
 
 def test_enabled_delivery_requires_an_explicit_backend_url(settings):
@@ -453,7 +544,15 @@ def test_alert_runs_keep_progress_on_overlap_and_retry_exact_body(monkeypatch, t
 
     backend = MagicMock()
     backend.__enter__.return_value = backend
-    backend.post.side_effect = [requests.Timeout(), response({"success": True}), response({"success": True})]
+    first_post = [True]
+
+    def post(url, **kwargs):
+        if first_post:
+            first_post.pop()
+            raise requests.Timeout()
+        return accepted_receipt(url, **kwargs)
+
+    backend.post.side_effect = post
     indexer = MagicMock()
     indexer.__enter__.return_value = indexer
     indexer.request.side_effect = [

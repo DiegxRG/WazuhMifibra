@@ -19,7 +19,7 @@ from wazuh_pull.backend_client import BackendAlarmClient, prepare_alarms
 from wazuh_pull.client import SourceError, WazuhClient, alert_key
 from wazuh_pull.collector import collect
 from wazuh_pull.config import Settings, load_settings
-from wazuh_pull.delivery import AlertWindow, alert_window, deliver
+from wazuh_pull.delivery import AlertWindow, alert_window, deliver, resolve_review
 from wazuh_pull.reconciliation import initial_alert_review
 
 log = logging.getLogger(__name__)
@@ -72,14 +72,17 @@ def _write_preview(path: Path, findings: list[dict], alarms: list[dict], review:
 
 def _log_delivery(result: dict) -> int:
     log.info(
-        "snapshot=%s confirmados=%s reenvios_confirmados=%s pendientes=%s",
+        "snapshot=%s confirmados=%s reenvios_confirmados=%s pendientes=%s en_revision=%s lote_en_revision=%s",
         result["snapshot"], result["sent"], result["replayed"], result["pending"],
+        result["review"], result["review_snapshot"],
     )
     if result["error"]:
         log.error("%s", result["error"])
     if result["snapshot"] == "snapshot_vacio_retenido":
         log.warning("La captura vacía quedó retenida por BACKEND_ALLOW_EMPTY=false.")
-    return int(bool(result["error"] or result["pending"] or result["snapshot"] == "snapshot_vacio_retenido"))
+    return int(bool(
+        result["error"] or result["pending"] or result["review"] or result["snapshot"] == "snapshot_vacio_retenido"
+    ))
 
 
 def _new_alerts(source: WazuhClient, window: AlertWindow, allowed_agents: set[str]) -> Iterator[dict]:
@@ -155,15 +158,24 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--input", type=Path, help="Procesa una muestra JSON local sin conexiones ni escrituras en SQLite.")
     mode.add_argument("--once", action="store_true", help="Ejecuta una captura del Indexer y termina.")
     mode.add_argument("--retry-pending", action="store_true", help="Reintenta la cola local sin consultar Wazuh.")
+    mode.add_argument("--retry-reviewed", metavar="SNAPSHOT_ID", help="Autoriza un solo intento para un lote revisado.")
+    mode.add_argument("--confirm-reviewed", metavar="SNAPSHOT_ID", help="Registra una confirmación verificada en el backend.")
     parser.add_argument("--no-backend", action="store_true", help="Deshabilita el envío y el estado de entrega.")
     parser.add_argument("--output", type=Path, help="Escribe un JSON local de vista previa con alarmas y hallazgos.")
     args = parser.parse_args(argv)
-    if args.retry_pending and args.output:
+    if args.output and (args.retry_pending or args.retry_reviewed or args.confirm_reviewed):
         parser.error("--output requiere una captura o una muestra.")
+    if args.no_backend and (args.retry_reviewed or args.confirm_reviewed):
+        parser.error("--no-backend deshabilita los cambios en el estado de entrega.")
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     try:
         settings = load_settings(args.env_file)
+        if args.retry_reviewed or args.confirm_reviewed:
+            snapshot_id = args.retry_reviewed or args.confirm_reviewed
+            resolve_review(settings, snapshot_id, confirmed=args.confirm_reviewed is not None)
+            log.info("Revisión actualizada para snapshot=%s", snapshot_id)
+            return 0
         if args.input:
             if args.output and args.output.resolve() == args.input.resolve():
                 parser.error("--output debe ser distinto de --input.")

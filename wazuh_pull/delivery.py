@@ -14,6 +14,8 @@ from pathlib import Path
 from wazuh_pull.backend_client import BackendAlarmClient
 from wazuh_pull.config import Settings
 
+MAX_ATTEMPTS = 3
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS checkpoints (
     scope TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,
@@ -23,7 +25,8 @@ CREATE TABLE IF NOT EXISTS snapshots (
     id INTEGER PRIMARY KEY, scope TEXT NOT NULL, snapshot_id TEXT NOT NULL,
     body TEXT NOT NULL, context TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0, next_attempt REAL NOT NULL DEFAULT 0,
-    acknowledged_at REAL, last_error TEXT, UNIQUE(scope, snapshot_id)
+    acknowledged_at REAL, last_error TEXT, delivery_status TEXT NOT NULL DEFAULT 'pending',
+    UNIQUE(scope, snapshot_id)
 );
 CREATE INDEX IF NOT EXISTS pending_snapshots ON snapshots(scope, id)
     WHERE acknowledged_at IS NULL;
@@ -123,6 +126,44 @@ def _sender_lock(path: Path) -> Iterator[None]:
         yield
 
 
+@contextmanager
+def _outbox(path: Path, scope: str) -> Iterator[sqlite3.Connection]:
+    with _sender_lock(path.with_name(f"{path.name}.{scope}.lock")), closing(sqlite3.connect(path, timeout=10)) as db:
+        os.chmod(path, 0o600)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=FULL")
+        db.executescript(SCHEMA)
+        with db:
+            # Lock the migration across scopes sharing this database.
+            db.execute("BEGIN IMMEDIATE")
+            columns = {column["name"] for column in db.execute("PRAGMA table_info(snapshots)")}
+            if "delivery_status" not in columns:
+                db.execute("ALTER TABLE snapshots ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'pending'")
+                db.execute("UPDATE snapshots SET delivery_status='acked' WHERE acknowledged_at IS NOT NULL")
+        yield db
+
+
+def resolve_review(settings: Settings, snapshot_id: str, *, confirmed: bool) -> None:
+    if not (settings.backend_url and settings.agent_group):
+        raise ValueError("Configura BACKEND_URL y WAZUH_AGENT_GROUP para identificar la cola.")
+    path = settings.delivery_state.resolve()
+    if not path.is_file():
+        raise ValueError("La base de entrega no existe.")
+    scope = _scope(settings)
+    with _outbox(path, scope) as db, db:
+        status = "acked" if confirmed else "retry_once"
+        changed = db.execute(
+            """UPDATE snapshots
+               SET delivery_status=?, next_attempt=0, acknowledged_at=?,
+                   last_error=CASE WHEN ? THEN NULL ELSE last_error END
+               WHERE scope=? AND snapshot_id=? AND acknowledged_at IS NULL AND delivery_status='review'""",
+            (status, time.time() if confirmed else None, confirmed, scope, snapshot_id),
+        ).rowcount
+        if not changed:
+            raise ValueError("El snapshot indicado no está en revisión en esta cola.")
+
+
 def _enqueue(
     db: sqlite3.Connection, scope: str, alarms: list[dict], findings: list[dict], started_at: float,
     *, deduplicate: bool = True,
@@ -187,7 +228,8 @@ def deliver(
     window: AlertWindow | None = None,
 ) -> dict:
     settings = backend.settings
-    result = {"snapshot": None, "sent": 0, "replayed": 0, "pending": 0, "error": ""}
+    result = {"snapshot": None, "sent": 0, "replayed": 0, "pending": 0, "review": 0,
+              "review_snapshot": None, "error": ""}
     if not settings.backend_enabled:
         return {**result, "snapshot": "envio_deshabilitado"}
     if not settings.backend_url:
@@ -207,12 +249,7 @@ def deliver(
 
     scope = _scope(settings)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with _sender_lock(path.with_name(f"{path.name}.{scope}.lock")), closing(sqlite3.connect(path, timeout=10)) as db:
-        os.chmod(path, 0o600)
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA synchronous=FULL")
-        db.executescript(SCHEMA)
+    with _outbox(path, scope) as db:
         if alarms is not None:
             # A successful window advances only after the event IDs and outbox body are durable together.
             with db:
@@ -226,22 +263,53 @@ def deliver(
                 "SELECT * FROM snapshots WHERE scope=? AND acknowledged_at IS NULL ORDER BY id LIMIT 1",
                 (scope,),
             ).fetchone()
-            if event is None or event["next_attempt"] > time.time():
+            if event is None:
                 break
+            if event["delivery_status"] == "review":
+                result["review_snapshot"] = event["snapshot_id"]
+                break
+            manual = event["delivery_status"] == "retry_once"
+            attempts = event["attempts"]
+            if not manual and attempts >= MAX_ATTEMPTS:
+                with db:
+                    db.execute(
+                        "UPDATE snapshots SET delivery_status='review', next_attempt=0 WHERE id=?", (event["id"],),
+                    )
+                result["review_snapshot"] = event["snapshot_id"]
+                result["error"] = "El lote agotó sus intentos automáticos"
+                break
+            now = time.time()
+            if event["next_attempt"] > now:
+                break
+            delay = min(settings.retry_seconds * 2 ** min(attempts, 30), settings.retry_max_seconds)
+            can_retry = not manual and attempts + 1 < MAX_ATTEMPTS
+            with db:
+                # Reserve the attempt before HTTP so a restart cannot bypass the limit.
+                db.execute(
+                    """UPDATE snapshots SET attempts=attempts+1, delivery_status=?, next_attempt=?, last_error=?
+                       WHERE id=?""",
+                    ("pending" if can_retry else "review", now + delay,
+                     "Proceso interrumpido o resultado del POST desconocido", event["id"]),
+                )
             receipt = backend.post_snapshot(event["body"])
             now = time.time()
             with db:
                 if receipt.accepted:
-                    db.execute("UPDATE snapshots SET acknowledged_at=?, last_error=NULL WHERE id=?", (now, event["id"]))
+                    db.execute(
+                        """UPDATE snapshots SET acknowledged_at=?, last_error=NULL, delivery_status='acked'
+                           WHERE id=?""", (now, event["id"]),
+                    )
                     result["sent"] += 1
                     result["replayed"] += int(receipt.replayed)
                 else:
-                    delay = min(settings.retry_seconds * 2 ** min(event["attempts"], 30), settings.retry_max_seconds)
+                    pending = can_retry and receipt.retryable
                     db.execute(
-                        """UPDATE snapshots SET attempts=attempts+1, next_attempt=?, last_error=? WHERE id=?""",
-                        (now + delay, receipt.error, event["id"]),
+                        "UPDATE snapshots SET delivery_status=?, next_attempt=?, last_error=? WHERE id=?",
+                        ("pending" if pending else "review", now + delay if pending else 0, receipt.error, event["id"]),
                     )
                     result["error"] = receipt.error
+                    if not pending:
+                        result["review_snapshot"] = event["snapshot_id"]
             if not receipt.accepted:
                 break
 
@@ -250,7 +318,10 @@ def deliver(
                 "DELETE FROM snapshots WHERE scope=? AND acknowledged_at<?",
                 (scope, time.time() - settings.ack_retention_days * 86400),
             )
-        result["pending"] = db.execute(
-            "SELECT count(*) FROM snapshots WHERE scope=? AND acknowledged_at IS NULL", (scope,),
-        ).fetchone()[0]
+        counts = dict(db.execute(
+            "SELECT delivery_status,count(*) FROM snapshots WHERE scope=? AND acknowledged_at IS NULL GROUP BY delivery_status",
+            (scope,),
+        ))
+        result["pending"] = counts.get("pending", 0) + counts.get("retry_once", 0)
+        result["review"] = counts.get("review", 0)
     return result

@@ -23,7 +23,7 @@ La muestra ficticia de inventario tiene tres documentos y produce dos alarmas. U
 
 ## Validar contra Wazuh
 
-Completa el archivo local `.env` a partir de `.env.example`. Configura la URL y la cuenta de lectura del Indexer, `WAZUH_AGENT_GROUP` con el grupo autorizado de Mi Fibra y `WAZUH_API_*` con una cuenta del Manager que pueda listar los agentes de ese grupo. Usa un `WAZUH_SOURCE_ID` estable y distinto para cada despliegue Wazuh, ya que forma parte de la identidad de sus agentes. Las conexiones usan HTTPS con verificación de certificado. Los parámetros `*_CA_BUNDLE` apuntan a los PEM de las CA cuando corresponda.
+Completa el archivo local `.env` a partir de `.env.example`. Configura `WAZUH_INDEXER_URL` y una cuenta de lectura que pueda consultar `wazuh-alerts-*`. Configura `WAZUH_API_URL` y una cuenta del Manager que pueda autenticarse y consultar `GET /groups/{group}/agents` para el valor exacto de `WAZUH_AGENT_GROUP`. Usa un `WAZUH_SOURCE_ID` estable y distinto para cada despliegue Wazuh, ya que forma parte de la identidad de sus agentes. Las URLs HTTPS deben coincidir con el nombre del certificado. Si la cadena es privada, indica el PEM de confianza en `WAZUH_INDEXER_CA_BUNDLE`, `WAZUH_API_CA_BUNDLE` o `BACKEND_CA_BUNDLE`, según el servicio.
 
 ```powershell
 python main.py --once --no-backend --output runtime/wazuh/preview-live.json
@@ -39,9 +39,11 @@ La primera captura revisa hasta 90 días de eventos `Active` y `Solved` (`WAZUH_
 
 Las capturas siguientes reanudan desde la última ventana completa con cinco minutos de solapamiento (`WAZUH_ALERT_OVERLAP_SECONDS`) para recuperar eventos tardíos. Se deduplica por índice y documento. Un evento distinto del mismo equipo y CVE puede generar otro aviso con el mismo `finding_id`. Una ventana sin detecciones nuevas avanza el cursor sin publicar una captura vacía. Los `Solved` se usan en la revisión inicial y los ciclos incrementales envían detecciones nuevas.
 
-`BACKEND_ENABLED` parte en `false`. Para habilitar el envío, configura la URL HTTPS del receptor en `BACKEND_URL` en el archivo local `.env`. SQLite guarda en la misma transacción los eventos vistos, el avance y el cuerpo del lote. El reintento usa el mismo identificador y cuerpo. Una búsqueda incompleta deja el cursor donde estaba.
+`BACKEND_ENABLED` parte en `false`. Para habilitar el envío, configura la URL HTTPS del receptor en `BACKEND_URL` en el archivo local `.env`. SQLite guarda en la misma transacción los eventos vistos, el avance y el cuerpo del lote. Una búsqueda incompleta deja el cursor donde estaba.
 
-`python main.py --retry-pending` vuelve a intentar la cola sin consultar Wazuh. `python main.py` corre en modo periódico usando `POLL_INTERVAL_SECONDS`. Mantén la base de entrega en disco local.
+Cada lote tiene un intento inicial y hasta dos reintentos automáticos ante fallos transitorios. SQLite registra el intento antes del POST. Cada reintento conserva el mismo identificador y cuerpo. La confirmación exige HTTP 2xx y un recibo con el mismo `snapshot_id`, `total_alarmas` y `registros_exitosos` iguales a la cantidad enviada, o una respuesta de duplicado que confirme todas las claves exactas. Si el receptor rechaza el lote definitivamente, confirma solo una parte o se agotan los intentos, el lote conserva su lugar en la cola y pasa a revisión.
+
+`python main.py --retry-pending` procesa los intentos programados sin consultar Wazuh. Para resolver un lote en revisión, `python main.py --retry-reviewed SNAPSHOT_ID` autoriza un solo intento adicional tras corregir el problema. Usa `python main.py --confirm-reviewed SNAPSHOT_ID` si verificaste que el receptor guardó el lote completo. Ambos comandos solo actualizan SQLite. `python main.py` corre en modo periódico usando `POLL_INTERVAL_SECONDS`. Mantén la base de entrega en disco local.
 
 Si se configura un índice concreto `wazuh-states-vulnerabilities-*`, el conector conserva el modo de inventario y envía capturas completas cuando cambia su contenido. `BACKEND_ALLOW_EMPTY` aplica a ese modo.
 

@@ -34,6 +34,7 @@ class Receipt:
     accepted: bool
     replayed: bool = False
     error: str = ""
+    retryable: bool = False
 
 
 class BackendAlarmClient:
@@ -52,26 +53,39 @@ class BackendAlarmClient:
                 allow_redirects=False,
             )
         except requests.RequestException as exc:
-            return Receipt(False, error=f"Error de transporte: {type(exc).__name__}")
-        if not 200 <= response.status_code < 300:
-            return Receipt(False, error=f"El backend respondió HTTP {response.status_code}")
+            retryable = isinstance(exc, (requests.Timeout, requests.ConnectionError)) and not isinstance(
+                exc, (requests.exceptions.SSLError, requests.exceptions.ProxyError),
+            )
+            return Receipt(False, error=f"Error de transporte: {type(exc).__name__}", retryable=retryable)
         try:
             result = response.json()
         except ValueError:
-            return Receipt(False, error="El backend devolvió JSON inválido")
+            result = None
+        if not 200 <= response.status_code < 300:
+            data = result.get("data") if isinstance(result, dict) else None
+            accepted = data.get("registros_exitosos") if isinstance(data, dict) else None
+            if type(accepted) is int and accepted > 0:
+                return Receipt(False, error="El backend reportó registros aceptados sin confirmar el snapshot completo")
+            return Receipt(
+                False, error=f"El backend respondió HTTP {response.status_code}",
+                retryable=response.status_code in {408, 429, 500, 502, 503, 504},
+            )
         if not isinstance(result, dict):
-            return Receipt(False, error="El backend devolvió un formato inesperado")
+            return Receipt(False, error="El backend devolvió un recibo inválido")
 
         payload = json.loads(body)
         if result.get("success") is True:
             data = result.get("data")
-            if isinstance(data, dict) and (
-                data.get("snapshot_id", payload["snapshot_id"]) != payload["snapshot_id"]
-                or data.get("registros_exitosos", len(payload["alarms"])) != len(payload["alarms"])
-                or data.get("errores")
+            expected = len(payload["alarms"])
+            if (
+                isinstance(data, dict)
+                and data.get("snapshot_id") == payload["snapshot_id"]
+                and all(type(data.get(key)) is int and data[key] == expected
+                        for key in ("total_alarmas", "registros_exitosos"))
+                and data.get("errores") in (None, [])
             ):
-                return Receipt(False, error="El backend confirmó un snapshot diferente o parcial")
-            return Receipt(True)
+                return Receipt(True)
+            return Receipt(False, error="El backend devolvió un recibo parcial, incompleto o de otro snapshot")
         if _confirmed_duplicate(result, payload):
             return Receipt(True, replayed=True)
         return Receipt(False, error="El backend no confirmó la entrega completa")
@@ -84,7 +98,12 @@ def _confirmed_duplicate(response: dict, payload: dict) -> bool:
     snapshot_id = payload["snapshot_id"]
     if response.get("success") is not False or not expected or not isinstance(data, dict):
         return False
-    if data.get("snapshot_id") != snapshot_id or data.get("total_alarmas") != len(expected):
+    if (
+        data.get("snapshot_id") != snapshot_id
+        or type(data.get("total_alarmas")) is not int
+        or data["total_alarmas"] != len(expected)
+        or data.get("registros_exitosos", 0) != 0
+    ):
         return False
     errors = data.get("errores")
     if not isinstance(errors, list) or len(errors) != len(expected):
